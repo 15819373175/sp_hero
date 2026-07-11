@@ -55,41 +55,101 @@ Plan Planner::plan(Target target, double bullet_speed)
     return {false};
   }
 
+  // ── 计时 ──
+  auto t0 = std::chrono::steady_clock::now();
+
   // 3. Solve yaw
   Eigen::VectorXd x0(2);
   x0 << traj(0, 0), traj(1, 0);
   tiny_set_x0(yaw_solver_, x0);
 
   yaw_solver_->work->Xref = traj.block(0, 0, 2, HORIZON);
-  tiny_solve(yaw_solver_);
+  int yaw_status = tiny_solve(yaw_solver_);
+  bool yaw_ok = (yaw_status == 0) && (yaw_solver_->solution->solved == 1);
 
   // 4. Solve pitch
   x0 << traj(2, 0), traj(3, 0);
   tiny_set_x0(pitch_solver_, x0);
 
   pitch_solver_->work->Xref = traj.block(2, 0, 2, HORIZON);
-  tiny_solve(pitch_solver_);
+  int pitch_status = tiny_solve(pitch_solver_);
+  bool pitch_ok = (pitch_status == 0) && (pitch_solver_->solution->solved == 1);
 
+  auto t1 = std::chrono::steady_clock::now();
+  solve_time_us_ = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+  // ── 只在状态翻转时打日志（避免刷屏）──
+  if (!yaw_ok && yaw_converged_) {
+    tools::logger()->warn(
+      "[Planner] Yaw MPC diverged (status={} iter={} pri={:.4f} dua={:.4f})",
+      yaw_status, yaw_solver_->work->iter,
+      yaw_solver_->work->primal_residual_state, yaw_solver_->work->dual_residual_state);
+  } else if (yaw_ok && !yaw_converged_) {
+    tools::logger()->info("[Planner] Yaw MPC recovered (iter={})", yaw_solver_->work->iter);
+  }
+
+  if (!pitch_ok && pitch_converged_) {
+    tools::logger()->warn(
+      "[Planner] Pitch MPC diverged (status={} iter={} pri={:.4f} dua={:.4f})",
+      pitch_status, pitch_solver_->work->iter,
+      pitch_solver_->work->primal_residual_state, pitch_solver_->work->dual_residual_state);
+  } else if (pitch_ok && !pitch_converged_) {
+    tools::logger()->info("[Planner] Pitch MPC recovered (iter={})", pitch_solver_->work->iter);
+  }
+
+  yaw_converged_ = yaw_ok;
+  pitch_converged_ = pitch_ok;
+
+  // 超时告警（>5ms 可能影响 10ms 控制周期）
+  if (solve_time_us_ > 5000) {
+    tools::logger()->warn("[Planner] MPC solve took {} us (>5ms)", solve_time_us_);
+  }
+
+  // ── 组装 Plan（收敛 / 降级）──
   Plan plan;
   plan.control = true;
 
   plan.target_yaw = tools::limit_rad(traj(0, HALF_HORIZON) + yaw0);
   plan.target_pitch = traj(2, HALF_HORIZON);
 
-  plan.yaw = tools::limit_rad(yaw_solver_->work->x(0, HALF_HORIZON) + yaw0);
-  plan.yaw_vel = yaw_solver_->work->x(1, HALF_HORIZON);
-  plan.yaw_acc = yaw_solver_->work->u(0, HALF_HORIZON);
+  if (yaw_ok) {
+    plan.yaw     = tools::limit_rad(yaw_solver_->work->x(0, HALF_HORIZON) + yaw0);
+    plan.yaw_vel = yaw_solver_->work->x(1, HALF_HORIZON);
+    plan.yaw_acc = yaw_solver_->work->u(0, HALF_HORIZON);
+  } else {
+    // 降级：退回参考轨迹，丢弃 MPC 加速度前馈
+    plan.yaw     = tools::limit_rad(traj(0, HALF_HORIZON) + yaw0);
+    plan.yaw_vel = traj(1, HALF_HORIZON);
+    plan.yaw_acc = 0;
+  }
 
-  plan.pitch = pitch_solver_->work->x(0, HALF_HORIZON);
-  plan.pitch_vel = pitch_solver_->work->x(1, HALF_HORIZON);
-  plan.pitch_acc = pitch_solver_->work->u(0, HALF_HORIZON);
+  if (pitch_ok) {
+    plan.pitch     = pitch_solver_->work->x(0, HALF_HORIZON);
+    plan.pitch_vel = pitch_solver_->work->x(1, HALF_HORIZON);
+    plan.pitch_acc = pitch_solver_->work->u(0, HALF_HORIZON);
+  } else {
+    // 降级：退回参考轨迹，丢弃 MPC 加速度前馈
+    plan.pitch     = traj(2, HALF_HORIZON);
+    plan.pitch_vel = traj(3, HALF_HORIZON);
+    plan.pitch_acc = 0;
+  }
 
-  auto shoot_offset_ = 2;
-  plan.fire =
-    std::hypot(
-      traj(0, HALF_HORIZON + shoot_offset_) - yaw_solver_->work->x(0, HALF_HORIZON + shoot_offset_),
-      traj(2, HALF_HORIZON + shoot_offset_) -
-        pitch_solver_->work->x(0, HALF_HORIZON + shoot_offset_)) < fire_thresh_;
+  // ── 射击判定：MPC 优化轨迹 vs 参考轨迹的跟踪误差 ──
+  constexpr int shoot_offset = 2;
+  double yaw_err = 0;
+  double pitch_err = 0;
+  if (yaw_ok) {
+    yaw_err = traj(0, HALF_HORIZON + shoot_offset) -
+              yaw_solver_->work->x(0, HALF_HORIZON + shoot_offset);
+  }
+  if (pitch_ok) {
+    pitch_err = traj(2, HALF_HORIZON + shoot_offset) -
+                pitch_solver_->work->x(0, HALF_HORIZON + shoot_offset);
+  }
+  // 降级时误差保持 0，保守允许射击（不下位机断线时卡住不开火）
+
+  plan.fire = std::hypot(yaw_err, pitch_err) < fire_thresh_;
+
   return plan;
 }
 
@@ -160,7 +220,8 @@ void Planner::setup_yaw_solver(const std::string & config_path)
   Eigen::MatrixXd u_max = Eigen::MatrixXd::Constant(1, HORIZON - 1, max_yaw_acc);
   tiny_set_bound_constraints(yaw_solver_, x_min, x_max, u_min, u_max);
 
-  yaw_solver_->settings->max_iter = 10;
+  // 默认 1000 太大，10 太小可能不收敛；30 在实时性和收敛性间取平衡
+  yaw_solver_->settings->max_iter = 30;
 }
 
 void Planner::setup_pitch_solver(const std::string & config_path)
@@ -186,7 +247,7 @@ void Planner::setup_pitch_solver(const std::string & config_path)
   Eigen::MatrixXd u_max = Eigen::MatrixXd::Constant(1, HORIZON - 1, max_pitch_acc);
   tiny_set_bound_constraints(pitch_solver_, x_min, x_max, u_min, u_max);
 
-  pitch_solver_->settings->max_iter = 10;
+  pitch_solver_->settings->max_iter = 30;
 }
 
 Eigen::Matrix<double, 2, 1> Planner::aim(const Target & target, double bullet_speed)

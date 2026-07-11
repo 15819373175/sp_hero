@@ -43,6 +43,10 @@ public:
   Plan plan(Target target, double bullet_speed, float current_yaw, float current_pitch);
   Plan plan(std::optional<Target> target, double bullet_speed, float current_yaw, float current_pitch);
 
+  // MPC 求解器健康查询
+  bool last_solve_ok() const { return yaw_converged_ && pitch_converged_; }
+  int64_t last_solve_time_us() const { return solve_time_us_; }
+
 private:
   double yaw_offset_;
   double pitch_offset_;
@@ -51,6 +55,11 @@ private:
 
   TinySolver * yaw_solver_;
   TinySolver * pitch_solver_;
+
+  // MPC 收敛诊断（每次 plan() 更新）
+  bool yaw_converged_ = true;
+  bool pitch_converged_ = true;
+  int64_t solve_time_us_ = 0;
 
   void setup_yaw_solver(const std::string & config_path);
   void setup_pitch_solver(const std::string & config_path);
