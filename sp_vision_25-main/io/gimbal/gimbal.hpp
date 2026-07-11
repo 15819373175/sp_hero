@@ -16,6 +16,21 @@
 namespace io
 {
 
+// ==========================================
+// 通信健康监控统计
+// ==========================================
+struct GimbalStats
+{
+  std::atomic<uint64_t> tx_frames{0};         // 发送帧总数
+  std::atomic<uint64_t> tx_errors{0};         // 发送失败次数
+  std::atomic<uint64_t> tx_dropped{0};        // 因限流丢弃的帧数
+  std::atomic<uint64_t> rx_frames{0};         // 成功接收帧总数
+  std::atomic<uint64_t> rx_checksum_err{0};   // 校验和错误数
+  std::atomic<uint64_t> rx_overflow{0};       // 队列溢出次数
+  std::atomic<int64_t> last_tx_time_us{0};    // 最后一次发送时间（us since epoch 近似）
+  std::atomic<int64_t> last_rx_time_us{0};    // 最后一次接收时间（us since epoch 近似）
+};
+
 enum class GimbalMode
 {
   IDLE,        // 空闲
@@ -51,6 +66,10 @@ public:
     bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
     float pitch_acc);
 
+  // 通信健康监控
+  GimbalStats stats() const;
+  bool is_gimbal_alive() const;
+
 private:
   // ==========================================
   // BCP 方案 B 协议常量
@@ -67,6 +86,8 @@ private:
   std::atomic<bool> serial_connected_{false};
   int consecutive_tx_failures_ = 0;
   mutable std::mutex mutex_;
+
+  GimbalStats stats_;
 
   GimbalMode mode_ = GimbalMode::IDLE;
   GimbalState state_;

@@ -9,6 +9,14 @@
 
 namespace io
 {
+
+// ── 辅助：获取近似的微秒时间戳 ──
+static int64_t now_us()
+{
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+}
+
 Gimbal::Gimbal(const std::string & config_path)
 {
   auto yaml = tools::load(config_path);
@@ -109,6 +117,7 @@ void Gimbal::send(
   static auto last_send_time = std::chrono::steady_clock::now();
   auto now = std::chrono::steady_clock::now();
   if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send_time).count() < 10) {
+      stats_.tx_dropped++;
       return;
   }
   last_send_time = now;
@@ -165,8 +174,11 @@ void Gimbal::send(
   try {
       serial_.write(frame_gimbal);
       consecutive_tx_failures_ = 0;
+      stats_.tx_frames++;
+      stats_.last_tx_time_us = now_us();
   } catch (const std::exception & e) {
       tools::logger()->warn("[Gimbal] Failed to write serial: {}", e.what());
+      stats_.tx_errors++;
       consecutive_tx_failures_++;
       // 连续丢 50 帧（约 500ms）触发自动重连
       if (consecutive_tx_failures_ > 50) {
@@ -257,6 +269,7 @@ void Gimbal::read_thread()
                           if (rx_sum == (calc_sum & 0xFF)) {
                               process_packet(packet_id, rx_data_buffer);
                           } else {
+                              stats_.rx_checksum_err++;
                               tools::logger()->debug("[Gimbal] Checksum failed.");
                           }
                           state = WAIT_HEAD;
@@ -309,6 +322,10 @@ void Gimbal::process_packet(uint8_t id, const std::vector<uint8_t>& data) {
         std::lock_guard<std::mutex> lock(mutex_);
         state_.yaw = static_cast<float>(yaw_rad);
         state_.pitch = static_cast<float>(pitch_rad);
+
+        // 更新接收统计
+        stats_.rx_frames++;
+        stats_.last_rx_time_us = now_us();
     }
 }
 
@@ -339,6 +356,20 @@ void Gimbal::reconnect()
   }
   tools::logger()->error("[Gimbal] Reconnect failed after {} attempts", max_retry_count);
   serial_connected_ = false;
+}
+
+GimbalStats Gimbal::stats() const
+{
+  return stats_;
+}
+
+bool Gimbal::is_gimbal_alive() const
+{
+  // 超过 100ms 没有收到下位机数据则判定离线
+  auto last_rx = stats_.last_rx_time_us.load();
+  if (last_rx == 0) return false;  // 从未收到过数据
+  auto now = now_us();
+  return (now - last_rx) < 100'000;  // 100ms 超时
 }
 
 }  // namespace io

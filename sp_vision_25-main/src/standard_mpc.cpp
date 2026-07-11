@@ -77,9 +77,14 @@ int main(int argc, char * argv[])
         auto gs = gimbal.state();
         auto plan = planner.plan(target, gs.bullet_speed);
 
-        gimbal.send(
-          plan.control, plan.fire, plan.yaw, plan.yaw_vel, plan.yaw_acc, plan.pitch, plan.pitch_vel,
-          plan.pitch_acc);
+        // 下位机离线时强制停止控制
+        if (!gimbal.is_gimbal_alive()) {
+          gimbal.send(false, false, 0, 0, 0, 0, 0, 0);
+        } else {
+          gimbal.send(
+            plan.control, plan.fire, plan.yaw, plan.yaw_vel, plan.yaw_acc, plan.pitch, plan.pitch_vel,
+            plan.pitch_acc);
+        }
 
         std::this_thread::sleep_for(10ms);
       } else
@@ -87,12 +92,39 @@ int main(int argc, char * argv[])
     }
   });
 
+  auto last_stats_time = std::chrono::steady_clock::now();
+  bool last_alive = false;
+  uint64_t frame_count = 0;
+
   while (!exiter.exit()) {
     mode = gimbal.mode();
 
     if (last_mode != mode) {
       tools::logger()->info("Switch to {}", gimbal.str(mode));
       last_mode = mode.load();
+    }
+
+    // ── 通信健康监控 ──
+    bool alive = gimbal.is_gimbal_alive();
+    if (alive != last_alive) {
+      if (!alive)
+        tools::logger()->error("[Main] Gimbal OFFLINE — no data from lower computer for >100ms");
+      else
+        tools::logger()->info("[Main] Gimbal ONLINE — communication restored");
+      last_alive = alive;
+    }
+
+    // 每约 1 秒打印一次通信统计
+    frame_count++;
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time).count() >= 1000) {
+      auto s = gimbal.stats();
+      tools::logger()->info(
+        "[Stats] TX:{} err:{} drop:{} | RX:{} chkerr:{} | alive:{}",
+        s.tx_frames.load(), s.tx_errors.load(), s.tx_dropped.load(),
+        s.rx_frames.load(), s.rx_checksum_err.load(),
+        alive ? "YES" : "NO");
+      last_stats_time = now;
     }
 
     camera.read(img, t);
