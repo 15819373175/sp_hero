@@ -64,6 +64,8 @@ private:
 
   std::thread thread_;
   std::atomic<bool> quit_ = false;
+  std::atomic<bool> serial_connected_{false};
+  int consecutive_tx_failures_ = 0;
   mutable std::mutex mutex_;
 
   GimbalMode mode_ = GimbalMode::IDLE;

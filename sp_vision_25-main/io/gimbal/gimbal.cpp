@@ -16,25 +16,30 @@ Gimbal::Gimbal(const std::string & config_path)
 
   try {
     serial_.setPort(com_port);
-    serial_.setBaudrate(115200); 
+    serial_.setBaudrate(115200);
     serial::Timeout to = serial::Timeout::simpleTimeout(100);
     serial_.setTimeout(to);
     serial_.open();
+    serial_connected_ = true;
   } catch (const std::exception & e) {
-    tools::logger()->error("[Gimbal] Failed to open serial: {}", e.what());
-    exit(1);
+    tools::logger()->error("[Gimbal] Failed to open serial: {} — will auto-reconnect", e.what());
+    serial_connected_ = false;
   }
 
   // 初始化状态
-  state_ = {0, 0, 0, 0, 25.0, 0}; 
-
-  thread_ = std::thread(&Gimbal::read_thread, this);
+  state_ = {0, 0, 0, 0, 25.0, 0};
 
   // 初始化队列防止为空
   auto now = std::chrono::steady_clock::now();
   queue_.push({Eigen::Quaterniond::Identity(), now});
-  
-  tools::logger()->info("[Gimbal] Serial initialized and read thread started.");
+
+  // 只有串口成功打开时才启动接收线程
+  if (serial_connected_) {
+    thread_ = std::thread(&Gimbal::read_thread, this);
+    tools::logger()->info("[Gimbal] Serial initialized and read thread started.");
+  } else {
+    tools::logger()->warn("[Gimbal] Read thread NOT started — will retry on first send()");
+  }
 }
 
 Gimbal::~Gimbal()
@@ -72,12 +77,12 @@ Eigen::Quaterniond Gimbal::q(std::chrono::steady_clock::time_point t)
   while (true) {
     if (queue_.empty()) return Eigen::Quaterniond::Identity();
 
-    auto [q_a, t_a] = queue_.pop(); 
+    auto [q_a, t_a] = queue_.pop();
     if (queue_.empty()) {
-        return q_a; 
+        return q_a;
     }
-    
-    auto [q_b, t_b] = queue_.front(); 
+
+    auto [q_b, t_b] = queue_.front();
 
     if (t <= t_a) return q_a;
 
@@ -94,13 +99,17 @@ void Gimbal::send(
   bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel,
   float pitch_acc)
 {
-  if (!serial_.isOpen()) return;
+  // 串口未连接时尝试自动重连
+  if (!serial_.isOpen() || !serial_connected_) {
+    reconnect();
+    if (!serial_.isOpen()) return;
+  }
 
   // [限流保护]
   static auto last_send_time = std::chrono::steady_clock::now();
   auto now = std::chrono::steady_clock::now();
   if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send_time).count() < 10) {
-      return; 
+      return;
   }
   last_send_time = now;
 
@@ -152,26 +161,37 @@ void Gimbal::send(
   for (uint8_t b : frame_gimbal) { sum_check += b; add_check += sum_check; }
   frame_gimbal.push_back(sum_check);
   frame_gimbal.push_back(add_check);
-  
-  try { 
-      serial_.write(frame_gimbal); 
+
+  try {
+      serial_.write(frame_gimbal);
+      consecutive_tx_failures_ = 0;
   } catch (const std::exception & e) {
       tools::logger()->warn("[Gimbal] Failed to write serial: {}", e.what());
+      consecutive_tx_failures_++;
+      // 连续丢 50 帧（约 500ms）触发自动重连
+      if (consecutive_tx_failures_ > 50) {
+        tools::logger()->error("[Gimbal] {} consecutive tx failures, triggering reconnect", consecutive_tx_failures_);
+        serial_connected_ = false;
+        reconnect();
+        consecutive_tx_failures_ = 0;
+      }
   }
 }
 
 void Gimbal::read_thread()
 {
   tools::logger()->info("[Gimbal] read_thread started.");
-  
+
   RxState state = WAIT_HEAD;
   std::vector<uint8_t> rx_data_buffer;
   uint8_t packet_id = 0;
   uint8_t packet_len = 0;
-  
+
   uint8_t calc_sum = 0;
   uint8_t calc_add = 0;
   uint8_t rx_sum = 0;
+
+  int consecutive_read_errors = 0;
 
   while (!quit_) {
       try {
@@ -179,19 +199,20 @@ void Gimbal::read_thread()
           if (available > 0) {
               std::vector<uint8_t> buffer;
               serial_.read(buffer, available);
+              consecutive_read_errors = 0;
 
               for (uint8_t byte : buffer) {
                   switch (state) {
                       case WAIT_HEAD:
-                          if (byte == HEAD_BYTE) { 
+                          if (byte == HEAD_BYTE) {
                               state = WAIT_D_ADDR;
-                              calc_sum = byte; 
+                              calc_sum = byte;
                               calc_add = calc_sum;
                           }
                           break;
                       case WAIT_D_ADDR:
                           if (byte == HEAD_BYTE) {
-                              state = WAIT_D_ADDR; 
+                              state = WAIT_D_ADDR;
                               calc_sum = byte;
                               calc_add = calc_sum;
                           } else {
@@ -209,8 +230,8 @@ void Gimbal::read_thread()
                       case WAIT_LEN:
                           packet_len = byte;
                           rx_data_buffer.clear();
-                          if (packet_len > 100) { 
-                              state = WAIT_HEAD; 
+                          if (packet_len > 100) {
+                              state = WAIT_HEAD;
                           } else {
                               rx_data_buffer.reserve(packet_len);
                               state = WAIT_DATA;
@@ -246,6 +267,12 @@ void Gimbal::read_thread()
               std::this_thread::sleep_for(std::chrono::milliseconds(1));
           }
       } catch (...) {
+          consecutive_read_errors++;
+          if (consecutive_read_errors > 100) {
+            tools::logger()->error("[Gimbal] 100 consecutive read errors, marking disconnected");
+            serial_connected_ = false;
+            consecutive_read_errors = 0;
+          }
           std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
   }
@@ -260,17 +287,17 @@ void Gimbal::process_packet(uint8_t id, const std::vector<uint8_t>& data) {
         return val;
     };
 
-    if (id == ID_GIMBAL) { 
+    if (id == ID_GIMBAL) {
         if (data.size() < 12) return;
-        
-        double yaw_deg = get_int32(1) / 1000.0;   
+
+        double yaw_deg = get_int32(1) / 1000.0;
         double pitch_deg = get_int32(5) / 1000.0;
-        
+
         if (std::abs(yaw_deg) > 360.0 || std::abs(pitch_deg) > 180.0) return;
 
         double yaw_rad = yaw_deg * M_PI / 180.0;
-        double pitch_rad = -pitch_deg * M_PI / 180.0; 
-        double roll_rad = 0; 
+        double pitch_rad = -pitch_deg * M_PI / 180.0;
+        double roll_rad = 0;
 
         Eigen::AngleAxisd rollAngle(roll_rad, Eigen::Vector3d::UnitX());
         Eigen::AngleAxisd pitchAngle(pitch_rad, Eigen::Vector3d::UnitY());
@@ -297,13 +324,21 @@ void Gimbal::reconnect()
 
     try {
       serial_.open();
+      serial_connected_ = true;
+      consecutive_tx_failures_ = 0;
+      // 重连后如果接收线程未启动，则启动它
+      if (!thread_.joinable()) {
+        thread_ = std::thread(&Gimbal::read_thread, this);
+      }
       tools::logger()->info("[Gimbal] Reconnected serial successfully.");
-      break;
+      return;
     } catch (const std::exception & e) {
       tools::logger()->warn("[Gimbal] Reconnect failed: {}", e.what());
       std::this_thread::sleep_for(std::chrono::seconds(1));
     }
   }
+  tools::logger()->error("[Gimbal] Reconnect failed after {} attempts", max_retry_count);
+  serial_connected_ = false;
 }
 
 }  // namespace io
