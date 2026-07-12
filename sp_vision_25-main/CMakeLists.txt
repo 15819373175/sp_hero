@@ -48,7 +48,6 @@ endif()
 # 子目录 (顺序敏感)
 # ==========================================
 add_subdirectory(tools)
-add_subdirectory(tasks/auto_aim/planner/tinympc)
 add_subdirectory(io)
 add_subdirectory(tasks/auto_aim)
 add_subdirectory(tasks/auto_buff)
@@ -131,14 +130,6 @@ endforeach()
 add_sp_target(uav       src/uav.cpp)
 add_sp_target(uav_debug src/uav_debug.cpp)
 
-# ── 海康 USB 姿态测试 (原始 target) ──
-add_executable(yolo26_hik_usb_pose src/yolo26_hik_usb_pose.cpp)
-target_include_directories(yolo26_hik_usb_pose PRIVATE ${MVS_INCLUDE_DIR})
-target_link_libraries(yolo26_hik_usb_pose ${OpenCV_LIBS} ${MVS_CAMERA_LIB})
-set_target_properties(yolo26_hik_usb_pose PROPERTIES
-    BUILD_RPATH "${MVS_ROOT}/lib/64"
-)
-
 # ==========================================
 # 测试程序
 # ==========================================
@@ -197,7 +188,6 @@ endif()
 
 # ── 其他测试 ──
 add_executable(dm_test                  tests/dm_test.cpp)
-add_executable(fire_test                tests/fire_test.cpp)
 add_executable(handeye_test             tests/handeye_test.cpp)
 add_executable(camera_detect_test       tests/camera_detect_test.cpp)
 add_executable(usbcamera_detect_test    tests/usbcamera_detect_test.cpp)
@@ -206,7 +196,7 @@ add_executable(multi_usbcamera_test     tests/multi_usbcamera_test.cpp)
 add_executable(minimum_vision_system    tests/minimum_vision_system.cpp)
 
 foreach(misc_target
-    dm_test fire_test handeye_test camera_detect_test
+    dm_test handeye_test camera_detect_test
     usbcamera_detect_test detector_video_test multi_usbcamera_test
     minimum_vision_system)
     target_link_libraries(${misc_target}
